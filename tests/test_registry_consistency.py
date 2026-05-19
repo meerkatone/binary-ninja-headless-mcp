@@ -124,3 +124,65 @@ def test_tool_handlers_map_to_backend_methods_without_dead_public_api() -> None:
     assert not dead_backend_methods, "backend public methods not reachable by tools: " + ", ".join(
         dead_backend_methods
     )
+
+
+def _ast_to_value(node: ast.AST) -> object:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.List):
+        return [_ast_to_value(e) for e in node.elts]
+    if isinstance(node, ast.Dict):
+        out: dict[object, object] = {}
+        for k, v in zip(node.keys, node.values, strict=True):
+            if isinstance(k, ast.Constant):
+                out[k.value] = _ast_to_value(v)
+        return out
+    return None
+
+
+def _array_without_items(schema: object, path: str, issues: list[str]) -> None:
+    if not isinstance(schema, dict):
+        return
+    type_field = schema.get("type")
+    types = (
+        [type_field]
+        if isinstance(type_field, str)
+        else [t for t in type_field if isinstance(t, str)]
+        if isinstance(type_field, list)
+        else []
+    )
+    if "array" in types and "items" not in schema:
+        if not (schema.get("oneOf") or schema.get("anyOf")):
+            issues.append(path)
+    for combinator in ("oneOf", "anyOf", "allOf"):
+        sub = schema.get(combinator)
+        if isinstance(sub, list):
+            for i, branch in enumerate(sub):
+                _array_without_items(branch, f"{path}.{combinator}[{i}]", issues)
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for name, sub in props.items():
+            _array_without_items(sub, f"{path}.{name}", issues)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _array_without_items(items, f"{path}.items", issues)
+
+
+def test_array_schemas_declare_items() -> None:
+    """Strict JSON Schema clients (Vercel AI SDK, etc.) reject array schemas without `items`."""
+    methods = _server_methods(_server_class(_parse(SERVER_PATH)))
+    issues: list[str] = []
+    for call in ast.walk(methods["_tool_definitions"]):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+            continue
+        if call.func.attr != "_tool":
+            continue
+        if len(call.args) < 3 or not isinstance(call.args[2], ast.Dict):
+            continue
+        first = call.args[0]
+        tool_name = first.value if isinstance(first, ast.Constant) else "<?>"
+        for prop_key, prop_val in zip(call.args[2].keys, call.args[2].values, strict=True):
+            if not (isinstance(prop_key, ast.Constant) and isinstance(prop_val, ast.Dict)):
+                continue
+            _array_without_items(_ast_to_value(prop_val), f"{tool_name}.{prop_key.value}", issues)
+    assert not issues, "array schemas missing 'items': " + ", ".join(issues)
