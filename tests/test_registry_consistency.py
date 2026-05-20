@@ -151,9 +151,12 @@ def _array_without_items(schema: object, path: str, issues: list[str]) -> None:
         if isinstance(type_field, list)
         else []
     )
-    if "array" in types and "items" not in schema:
-        if not (schema.get("oneOf") or schema.get("anyOf")):
-            issues.append(path)
+    if (
+        "array" in types
+        and "items" not in schema
+        and not (schema.get("oneOf") or schema.get("anyOf"))
+    ):
+        issues.append(path)
     for combinator in ("oneOf", "anyOf", "allOf"):
         sub = schema.get(combinator)
         if isinstance(sub, list):
