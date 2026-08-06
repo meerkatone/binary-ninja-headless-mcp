@@ -2490,7 +2490,7 @@ class SimpleMcpServer:
 
     def _tool_analysis_update_and_wait(self, arguments: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_str(arguments, "session_id")
-        return self._backend.analysis_update(session_id, wait=True)
+        return self._backend.analysis_update_and_wait(session_id)
 
     def _tool_analysis_abort(self, arguments: dict[str, Any]) -> dict[str, Any]:
         session_id = self._require_str(arguments, "session_id")
