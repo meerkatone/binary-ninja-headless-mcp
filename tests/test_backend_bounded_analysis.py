@@ -101,6 +101,49 @@ def _open(backend: BinjaBackend, path: str) -> str:
     return str(summary["session_id"])
 
 
+def test_open_session_analyzes_inline_when_analysis_is_fast(fake_backend: BinjaBackend) -> None:
+    summary = fake_backend.open_session("/fake/fast", update_analysis=True, deterministic=False)
+
+    assert summary["session_id"]
+    assert summary["analysis"] == "completed"
+    assert summary["task_id"]
+
+
+def test_open_session_registers_session_when_analysis_is_slow(
+    fake_backend: BinjaBackend,
+    control: _AnalysisControl,
+) -> None:
+    control.delay = SLOW_ANALYSIS_S
+
+    started = time.monotonic()
+    summary = fake_backend.open_session("/fake/slow", update_analysis=True, deterministic=False)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < RETURN_DEADLINE_S
+    assert summary["analysis"] == "running"
+    assert summary["task_id"]
+
+    # The regression this guards: the session exists and is usable even though the
+    # analysis is still running.
+    session_id = summary["session_id"]
+    assert fake_backend.binary_summary(session_id)["session_id"] == session_id
+
+
+def test_open_session_registers_session_when_analysis_fails(
+    fake_backend: BinjaBackend,
+    control: _AnalysisControl,
+) -> None:
+    control.fail = True
+
+    summary = fake_backend.open_session("/fake/broken", update_analysis=True, deterministic=False)
+
+    assert summary["analysis"] == "failed"
+    assert "analysis exploded" in summary["analysis_error"]
+
+    session_id = summary["session_id"]
+    assert fake_backend.binary_summary(session_id)["session_id"] == session_id
+
+
 def test_update_and_wait_returns_completed_status_within_budget(
     fake_backend: BinjaBackend,
 ) -> None:

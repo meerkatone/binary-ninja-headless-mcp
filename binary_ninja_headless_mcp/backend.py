@@ -99,13 +99,17 @@ class BinjaBackend:
         if deterministic:
             self._apply_determinism_env(True)
 
-        view = self._load_view(path, update_analysis=update_analysis, options=options or {})
+        # Load without blocking on full analysis, then register the session before
+        # running it. A synchronous full analysis here can outlive the MCP client's
+        # request timeout and drop the connection *before* the session is
+        # registered, leaving the caller with no session at all. See _finalize_open.
+        view = self._load_view(path, update_analysis=False, options=options or {})
         session_id = self._register_session(
             view,
             read_only=read_only,
             deterministic=deterministic,
         )
-        return self.binary_summary(session_id)
+        return self._finalize_open(session_id, update_analysis)
 
     def open_session_from_bytes(
         self,
@@ -138,9 +142,12 @@ class BinjaBackend:
             tmp.write(raw_bytes)
 
         try:
+            # Non-blocking load; the requested analysis runs after the session is
+            # registered (see _finalize_open) so a large binary cannot drop the
+            # connection before the session exists.
             view = self._load_view(
                 temp_path,
-                update_analysis=update_analysis,
+                update_analysis=False,
                 options=options or {},
             )
         except Exception:
@@ -154,7 +161,7 @@ class BinjaBackend:
             deterministic=deterministic,
             temp_path=temp_path,
         )
-        return self.binary_summary(session_id)
+        return self._finalize_open(session_id, update_analysis)
 
     def open_session_from_existing(
         self,
@@ -177,6 +184,47 @@ class BinjaBackend:
             read_only=read_only,
             deterministic=deterministic,
         )
+
+    def _finalize_open(self, session_id: str, update_analysis: bool) -> dict[str, Any]:
+        """Return the session summary, running any requested analysis off-thread.
+
+        The session is already registered by the time this runs, so even if the
+        analysis is slow or fails the caller always gets a usable session. Waits up
+        to ANALYSIS_WAIT_BUDGET_S so small binaries still return a fully analysed
+        summary; larger ones return immediately with a task handle to poll while
+        analysis continues in the background.
+        """
+        if not update_analysis:
+            return self.binary_summary(session_id)
+
+        submitted = self.task_start_analysis_update(session_id)
+        task_id = submitted["task_id"]
+        record = self._get_task(task_id)
+
+        try:
+            record.future.result(timeout=ANALYSIS_WAIT_BUDGET_S)
+        except FuturesTimeoutError:
+            summary = self.binary_summary(session_id)
+            summary["analysis"] = "running"
+            summary["task_id"] = task_id
+            summary["notice"] = (
+                "session created; analysis still running after "
+                f"{ANALYSIS_WAIT_BUDGET_S:.0f}s. Results are partial until it finishes: "
+                f"poll task.status / task.result with task_id={task_id} (or "
+                "analysis.status with session_id) until the state is IdleState."
+            )
+            return summary
+        except Exception as exc:  # the analysis failed, but the session stays valid
+            summary = self.binary_summary(session_id)
+            summary["analysis"] = "failed"
+            summary["task_id"] = task_id
+            summary["analysis_error"] = str(exc)
+            return summary
+
+        summary = self.binary_summary(session_id)
+        summary["analysis"] = "completed"
+        summary["task_id"] = task_id
+        return summary
 
     def set_session_mode(
         self,
