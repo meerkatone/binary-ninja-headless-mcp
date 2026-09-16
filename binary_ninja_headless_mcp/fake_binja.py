@@ -54,6 +54,16 @@ class FakeBinaryView:
             FakeStringRef(start=0x1800, length=5, value="hello"),
             FakeStringRef(start=0x1810, length=5, value="world"),
         ]
+        self.analysis_is_aborted = False
+
+    def update_analysis(self) -> None:
+        return None
+
+    def update_analysis_and_wait(self) -> None:
+        return None
+
+    def abort_analysis(self) -> None:
+        self.analysis_is_aborted = True
 
     def search(self, pattern: str, raw: bool = False, limit: int = 50) -> list[tuple[int, bytes]]:  # noqa: ARG002
         if pattern == "hello":
