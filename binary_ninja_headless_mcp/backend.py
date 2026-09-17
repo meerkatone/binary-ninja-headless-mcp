@@ -12,7 +12,6 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass, field, fields, is_dataclass
 from types import ModuleType
@@ -26,13 +25,6 @@ DETERMINISM_ENV_KEYS = (
 )
 
 MAX_MEMORY_READ_BYTES = 64 * 1024
-
-# How long a tool may block the MCP connection waiting for a full analysis before
-# it returns a task handle instead of continuing to wait inline. Kept well under
-# typical MCP client request timeouts so a long analysis on a large binary never
-# causes the client to tear down the transport ("server not connected").
-# Tunable via BN_MCP_ANALYSIS_WAIT_BUDGET (seconds).
-ANALYSIS_WAIT_BUDGET_S = float(os.environ.get("BN_MCP_ANALYSIS_WAIT_BUDGET", "25"))
 
 
 class BinjaBackendError(RuntimeError):
@@ -99,17 +91,13 @@ class BinjaBackend:
         if deterministic:
             self._apply_determinism_env(True)
 
-        # Load without blocking on full analysis, then register the session before
-        # running it. A synchronous full analysis here can outlive the MCP client's
-        # request timeout and drop the connection *before* the session is
-        # registered, leaving the caller with no session at all. See _finalize_open.
-        view = self._load_view(path, update_analysis=False, options=options or {})
+        view = self._load_view(path, update_analysis=update_analysis, options=options or {})
         session_id = self._register_session(
             view,
             read_only=read_only,
             deterministic=deterministic,
         )
-        return self._finalize_open(session_id, update_analysis)
+        return self.binary_summary(session_id)
 
     def open_session_from_bytes(
         self,
@@ -142,12 +130,9 @@ class BinjaBackend:
             tmp.write(raw_bytes)
 
         try:
-            # Non-blocking load; the requested analysis runs after the session is
-            # registered (see _finalize_open) so a large binary cannot drop the
-            # connection before the session exists.
             view = self._load_view(
                 temp_path,
-                update_analysis=False,
+                update_analysis=update_analysis,
                 options=options or {},
             )
         except Exception:
@@ -161,7 +146,7 @@ class BinjaBackend:
             deterministic=deterministic,
             temp_path=temp_path,
         )
-        return self._finalize_open(session_id, update_analysis)
+        return self.binary_summary(session_id)
 
     def open_session_from_existing(
         self,
@@ -184,47 +169,6 @@ class BinjaBackend:
             read_only=read_only,
             deterministic=deterministic,
         )
-
-    def _finalize_open(self, session_id: str, update_analysis: bool) -> dict[str, Any]:
-        """Return the session summary, running any requested analysis off-thread.
-
-        The session is already registered by the time this runs, so even if the
-        analysis is slow or fails the caller always gets a usable session. Waits up
-        to ANALYSIS_WAIT_BUDGET_S so small binaries still return a fully analysed
-        summary; larger ones return immediately with a task handle to poll while
-        analysis continues in the background.
-        """
-        if not update_analysis:
-            return self.binary_summary(session_id)
-
-        submitted = self.task_start_analysis_update(session_id)
-        task_id = submitted["task_id"]
-        record = self._get_task(task_id)
-
-        try:
-            record.future.result(timeout=ANALYSIS_WAIT_BUDGET_S)
-        except FuturesTimeoutError:
-            summary = self.binary_summary(session_id)
-            summary["analysis"] = "running"
-            summary["task_id"] = task_id
-            summary["notice"] = (
-                "session created; analysis still running after "
-                f"{ANALYSIS_WAIT_BUDGET_S:.0f}s. Results are partial until it finishes: "
-                f"poll task.status / task.result with task_id={task_id} (or "
-                "analysis.status with session_id) until the state is IdleState."
-            )
-            return summary
-        except Exception as exc:  # the analysis failed, but the session stays valid
-            summary = self.binary_summary(session_id)
-            summary["analysis"] = "failed"
-            summary["task_id"] = task_id
-            summary["analysis_error"] = str(exc)
-            return summary
-
-        summary = self.binary_summary(session_id)
-        summary["analysis"] = "completed"
-        summary["task_id"] = task_id
-        return summary
 
     def set_session_mode(
         self,
@@ -337,64 +281,6 @@ class BinjaBackend:
             raise BinjaBackendError(f"analysis update failed: {exc}") from exc
 
         return self.analysis_status(session_id)
-
-    def analysis_update_and_wait(self, session_id: str) -> dict[str, Any]:
-        """Update analysis without holding the MCP connection open indefinitely.
-
-        ``BinaryView.update_analysis_and_wait()`` can run for minutes on a large
-        binary. Running it inline holds the request handler long enough for the MCP
-        client to hit its request timeout and drop the transport, even though the
-        server and the open view are healthy.
-
-        The update runs on the shared task executor instead, and we wait only up to
-        ``ANALYSIS_WAIT_BUDGET_S``. Finishing in time returns the completed analysis
-        status, matching the previous blocking behaviour. Otherwise this returns
-        immediately with a ``task_id`` and a running snapshot, so the caller can poll
-        ``task.status`` / ``task.result`` and cancel via ``task.cancel``.
-        """
-        _ = self._get_view(session_id)  # validate the session before submitting
-
-        submitted = self.task_start_analysis_update(session_id)
-        task_id = submitted["task_id"]
-        record = self._get_task(task_id)
-
-        try:
-            result = record.future.result(timeout=ANALYSIS_WAIT_BUDGET_S)
-        except FuturesTimeoutError:
-            status = self.analysis_status(session_id)
-            status.update(
-                {
-                    "wait_completed": False,
-                    "task_id": task_id,
-                    "task_status": self._task_status_value(record),
-                    "notice": (
-                        f"analysis still running after {ANALYSIS_WAIT_BUDGET_S:.0f}s; "
-                        "returned without blocking the connection. Poll task.status / "
-                        f"task.result with task_id={task_id} (or analysis.status with "
-                        "session_id) until the state is IdleState; cancel with task.cancel."
-                    ),
-                }
-            )
-            return status
-        except BinjaBackendError:
-            raise
-        except Exception as exc:  # pragma: no cover - depends on binaryninja internals
-            raise BinjaBackendError(f"analysis update failed: {exc}") from exc
-
-        # task_start_analysis_update runs analysis_update(wait=True), which returns
-        # an analysis_status dict.
-        if isinstance(result, dict):
-            completed = dict(result)
-            completed["wait_completed"] = True
-            completed["task_id"] = task_id
-            return completed
-
-        return {
-            "session_id": session_id,
-            "wait_completed": True,
-            "task_id": task_id,
-            "result": self._to_jsonable(result),
-        }
 
     def analysis_abort(self, session_id: str) -> dict[str, Any]:
         view = self._get_view(session_id)
